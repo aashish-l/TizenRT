@@ -214,13 +214,19 @@ static void roll_stats(struct dhara_journal *j)
 	j->bb_current = 0;
 	j->epoch++;
 }
-
+/* ToDo Make this config as part of Kconfig and defconfig */
+#define CONFIG_DHARA_IMMEDIATE_FLUSH 1
 void dhara_journal_init(struct dhara_journal *j, const struct dhara_nand *n, uint8_t *page_buf)
 {
 	/* Set fixed parameters */
 	j->nand = n;
 	j->page_buf = page_buf;
+
+#ifdef CONFIG_DHARA_IMMEDIATE_FLUSH
+	j->log2_ppc = 1;  // Immediate flushing
+#else
 	j->log2_ppc = choose_ppc(n->log2_page_size, n->log2_ppb);
+#endif
 
 	reset_journal(j);
 }
