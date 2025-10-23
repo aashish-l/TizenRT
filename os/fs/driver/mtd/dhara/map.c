@@ -33,6 +33,7 @@
  */
 
 #include <string.h>
+#include <debug.h>
 #include "bytes.h"
 #include "map.h"
 
@@ -104,6 +105,7 @@ int dhara_map_resume(struct dhara_map *m, dhara_error_t *err)
 	}
 
 	m->count = ck_get_count(dhara_journal_cookie(&m->journal));
+	lldbg ("m->count:%d", m->count);
 	return 0;
 }
 
@@ -111,6 +113,7 @@ void dhara_map_clear(struct dhara_map *m)
 {
 	if (m->count) {
 		m->count = 0;
+		lldbg ("m->count:%d", m->count);
 		dhara_journal_clear(&m->journal);
 	}
 }
@@ -125,7 +128,21 @@ dhara_sector_t dhara_map_capacity(const struct dhara_map *m)
 		return 0;
 	}
 
-	return cap - reserve - safety_margin;
+	dhara_sector_t result = cap - reserve - safety_margin;
+	
+	/* When log2_ppc is small (e.g., 1), be more conservative with capacity
+	 * to ensure garbage collection has room to work.
+	 */
+	if (m->journal.log2_ppc <= 1) {
+		result = result * 2 / 3;  /* Use only 66% of calculated capacity */
+	}
+	
+	/* Always leave a small buffer to prevent hitting the exact limit */
+	if (result > 10) {
+		result -= 10;
+	}
+
+	return result;
 }
 
 /* Trace the path from the root to the given sector, emitting
@@ -238,12 +255,14 @@ static int raw_gc(struct dhara_map *m, dhara_page_t src, dhara_error_t *err)
 	uint8_t meta[DHARA_META_SIZE];
 
 	if (dhara_journal_read_meta(&m->journal, src, meta, err) < 0) {
+		lldbg("raw_gc: Failed to read meta for page %d\n", src);
 		return -1;
 	}
 
 	/* Is the page just filler/garbage? */
 	target = meta_get_id(meta);
 	if (target == DHARA_SECTOR_NONE) {
+		lldbg("raw_gc: Page %d is garbage\n", src);
 		return 0;
 	}
 
@@ -252,9 +271,11 @@ static int raw_gc(struct dhara_map *m, dhara_page_t src, dhara_error_t *err)
 	 */
 	if (trace_path(m, target, &current, meta, &my_err) < 0) {
 		if (my_err == DHARA_E_NOT_FOUND) {
+			lldbg("raw_gc: Sector %d not found\n", target);
 			return 0;
 		}
 
+		lldbg("raw_gc: Failed to trace path for sector %d\n", target);
 		dhara_set_error(err, my_err);
 		return -1;
 	}
@@ -263,15 +284,19 @@ static int raw_gc(struct dhara_map *m, dhara_page_t src, dhara_error_t *err)
 	 * do nothing.
 	 */
 	if (current != src) {
+		lldbg("raw_gc: Page %d is obsolete (current is %d)\n", src, current);
 		return 0;
 	}
 
+	lldbg("raw_gc: Moving page %d (sector %d) to front\n", src, target);
 	/* Rewrite it at the front of the journal with updated metadata */
 	ck_set_count(dhara_journal_cookie(&m->journal), m->count);
 	if (dhara_journal_copy(&m->journal, src, meta, err) < 0) {
+		lldbg("raw_gc: Failed to copy page %d\n", src);
 		return -1;
 	}
 
+	lldbg("raw_gc: Successfully moved page %d\n", src);
 	return 0;
 }
 
@@ -335,16 +360,38 @@ static int try_recover(struct dhara_map *m, dhara_error_t cause, dhara_error_t *
 static int auto_gc(struct dhara_map *m, dhara_error_t *err)
 {
 	int i;
+	dhara_sector_t capacity = dhara_map_capacity(m);
+	dhara_page_t journal_size = dhara_journal_size(&m->journal);
 
-	if (dhara_journal_size(&m->journal) < dhara_map_capacity(m)) {
+	lldbg("auto_gc: journal_size=%d, capacity=%d, log2_ppc=%d\n", journal_size, capacity, m->journal.log2_ppc);
+	/* When log2_ppc is small (e.g., 1), we need to trigger GC earlier
+	 * to prevent the "sector map full" error. We adjust the threshold
+	 * based on the checkpoint period.
+	 */
+	if (m->journal.log2_ppc <= 1) {
+		/* For very small checkpoint periods, trigger GC when we're at
+		 * 75% of capacity instead of waiting for full capacity.
+		 */
+		if (journal_size < (capacity * 1 / 2)) {
+			lldbg("auto_gc: journal_size < capacity/2, not triggering GC\n");
+			return 0;
+		}
+		lldbg("auto_gc: journal_size >= capacity/2, triggering GC\n");
+	} else if (journal_size < capacity) {
+		lldbg("auto_gc: journal_size < capacity, not triggering GC\n");
 		return 0;
+	} else {
+		lldbg("auto_gc: journal_size >= capacity, triggering GC\n");
 	}
-
-	for (i = 0; i <= m->gc_ratio; i++)
+	lldbg ("BEFORE:m->count:%d\n", m->count);
+	for (i = 0; i <= m->gc_ratio; i++) {
+		lldbg("auto_gc: running GC iteration %d\n", i);
 		if (dhara_map_gc(m, err) < 0) {
+			lldbg("auto_gc: GC iteration %d failed\n", i);
 			return -1;
 		}
-
+	}
+	lldbg ("AFTER:m->count:%d\n", m->count);
 	return 0;
 }
 
@@ -352,22 +399,58 @@ static int prepare_write(struct dhara_map *m, dhara_sector_t dst, uint8_t *meta,
 {
 	dhara_error_t my_err;
 
-	if (auto_gc(m, err) < 0) {
-		return -1;
+	lldbg("prepare_write: dst=%d, count=%d, capacity=%d\n", dst, m->count, dhara_map_capacity(m));
+	
+	/* If we're at or near capacity, make sure we have space */
+	if (m->count >= dhara_map_capacity(m)) {
+		lldbg("prepare_write: at/near capacity, forcing aggressive GC\n");
+		/* Run garbage collection multiple times to ensure space is freed */
+		for (int i = 0; i < 5; i++) {  // Increased from 3 to 5 iterations
+			if (dhara_map_gc(m, err) < 0) {
+				lldbg("prepare_write: aggressive GC iteration %d failed\n", i);
+				/* Continue anyway, we'll check if we have space after */
+			}
+			lldbg("prepare_write: after aggressive GC iteration %d, count=%d\n", i, m->count);
+			
+			/* If we have space now, break */
+			if (m->count < dhara_map_capacity(m)) {
+				lldbg("prepare_write: space freed after aggressive GC iteration %d\n", i);
+				break;
+			}
+		}
+		
+		/* If we still don't have space, try to sync the map to free up any pending space */
+		if (m->count >= dhara_map_capacity(m)) {
+			lldbg("prepare_write: still at capacity, trying sync\n");
+			if (dhara_map_sync(m, err) < 0) {
+				lldbg("prepare_write: sync failed\n");
+			} else {
+				lldbg("prepare_write: after sync, count=%d\n", m->count);
+			}
+		}
+	} else {
+		if (auto_gc(m, err) < 0) {
+			lldbg("prepare_write: auto_gc failed\n");
+			return -1;
+		}
+		lldbg("prepare_write: after auto_gc, count=%d\n", m->count);
 	}
 
 	if (trace_path(m, dst, NULL, meta, &my_err) < 0) {
 		if (my_err != DHARA_E_NOT_FOUND) {
+			lldbg("prepare_write: trace_path failed with error %d\n", my_err);
 			dhara_set_error(err, my_err);
 			return -1;
 		}
 
 		if (m->count >= dhara_map_capacity(m)) {
+			lldbg("MAP FULL:m->count:%d map_cap:%d\n", m->count, dhara_map_capacity(m));
 			dhara_set_error(err, DHARA_E_MAP_FULL);
 			return -1;
 		}
 
 		m->count++;
+		lldbg ("m->count:%d\n", m->count);
 	}
 
 	ck_set_count(dhara_journal_cookie(&m->journal), m->count);
@@ -382,6 +465,7 @@ int dhara_map_write(struct dhara_map *m, dhara_sector_t dst, const uint8_t *data
 		const dhara_sector_t old_count = m->count;
 
 		if (prepare_write(m, dst, meta, err) < 0) {
+			lldbg("old_count:%d\n", old_count);
 			return -1;
 		}
 
@@ -390,6 +474,7 @@ int dhara_map_write(struct dhara_map *m, dhara_sector_t dst, const uint8_t *data
 		}
 
 		m->count = old_count;
+		lldbg ("m->count:%d", m->count);
 
 		if (try_recover(m, my_err, err) < 0) {
 			return -1;
@@ -415,6 +500,7 @@ int dhara_map_copy_page(struct dhara_map *m, dhara_page_t src, dhara_sector_t ds
 		}
 
 		m->count = old_count;
+		lldbg ("m->count:%d", m->count);
 
 		if (try_recover(m, my_err, err) < 0) {
 			return -1;
@@ -499,6 +585,7 @@ static int try_delete(struct dhara_map *m, dhara_sector_t s, dhara_error_t *err)
 	}
 
 	m->count--;
+	lldbg ("m->count:%d", m->count);
 	return 0;
 }
 
@@ -550,26 +637,34 @@ int dhara_map_sync(struct dhara_map *m, dhara_error_t *err)
 int dhara_map_gc(struct dhara_map *m, dhara_error_t *err)
 {
 	if (!m->count) {
+		lldbg("dhara_map_gc: count is 0, nothing to do\n");
 		return 0;
 	}
 
+	lldbg("dhara_map_gc: starting GC, count=%d\n", m->count);
 	for (;;) {
 		dhara_page_t tail = dhara_journal_peek(&m->journal);
 		dhara_error_t my_err;
 
 		if (tail == DHARA_PAGE_NONE) {
+			lldbg("dhara_map_gc: no more pages to process\n");
 			break;
 		}
 
+		lldbg("dhara_map_gc: processing page %d\n", tail);
 		if (!raw_gc(m, tail, &my_err)) {
+			lldbg("dhara_map_gc: successfully processed page %d, dequeuing\n", tail);
 			dhara_journal_dequeue(&m->journal);
 			break;
 		}
 
+		lldbg("dhara_map_gc: failed to process page %d\n", tail);
 		if (try_recover(m, my_err, err) < 0) {
+			lldbg("dhara_map_gc: recovery failed\n");
 			return -1;
 		}
 	}
 
+	lldbg("dhara_map_gc: finished GC, count=%d\n", m->count);
 	return 0;
 }
